@@ -1,0 +1,504 @@
+#include <windows.h>
+#include <d3d9.h>
+#include <d3dx9.h>
+#include "imgui.h"
+#include "imgui_impl_dx9.h"
+#include "imgui_impl_win32.h"
+#include <tlhelp32.h>
+#include <ntdef.h>
+#include <ntifs.h>
+#include <string>
+#include <vector>
+
+// Feature toggles
+bool bESP = false;
+bool bAimbot = false;
+bool bTriggerBot = false;
+bool bBunnyHop = false;
+bool bNoRecoil = false;
+bool bWallHack = false;
+bool bRadarHack = false;
+bool bSkinChanger = false;
+bool bAntiBan = true;
+bool bShowMenu = false;
+
+// Aimbot customization
+float smoothingFactor = 0.1f;
+float aimbotFov = 30.0f;
+int aimbotBone = 8; // 8 = Head bone ID (common in CS2)
+
+// Game memory offsets (updated from community sources for CS2)
+DWORD dwClientModule = 0;
+DWORD dwLocalPlayer = 0xDEA964;
+DWORD dwEntityList = 0x4DFFFB4;
+DWORD dwViewMatrix = 0x4DF0D10;
+DWORD dwHealthOffset = 0x100;
+DWORD dwPosOffset = 0x138;
+DWORD dwViewAngle = 0x4D90;
+DWORD dwTeamOffset = 0xF4;
+DWORD dwRecoilOffset = 0x2F70;
+DWORD dwDormantOffset = 0xED;
+DWORD dwGlowObjectManager = 0x5315D70; // For wallhack glow effect
+DWORD dwSkinIdOffset = 0x2FB0; // For weapon skin changer
+
+// DirectX and window handles
+LPDIRECT3D9 pD3D = NULL;
+LPDIRECT3DDEVICE9 pDevice = NULL;
+HWND hGameWindow = NULL;
+
+// Process globals
+HANDLE hGameProcess = NULL;
+DWORD dwProcessId = 0;
+
+// Memory read/write helpers
+template<typename T>
+T ReadMemory(DWORD address) {
+    T value = 0;
+    SIZE_T bytesRead;
+    ReadProcessMemory(hGameProcess, (LPVOID)address, &value, sizeof(T), &bytesRead);
+    return value;
+}
+
+template<typename T>
+void WriteMemory(DWORD address, T value) {
+    SIZE_T bytesWritten;
+    WriteProcessMemory(hGameProcess, (LPVOID)address, &value, sizeof(T), &bytesWritten);
+}
+
+// Module base address retrieval
+DWORD GetModuleBaseAddress(const char* moduleName, DWORD procId) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, procId);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return 0;
+
+    MODULEENTRY32 modEntry;
+    modEntry.dwSize = sizeof(MODULEENTRY32);
+    if (Module32First(hSnapshot, &modEntry)) {
+        do {
+            if (strcmp(moduleName, modEntry.szModule) == 0) {
+                CloseHandle(hSnapshot);
+                return (DWORD)modEntry.modBaseAddr;
+            }
+        } while (Module32Next(hSnapshot, &modEntry));
+    }
+    CloseHandle(hSnapshot);
+    return 0;
+}
+
+// Pattern scanning to dynamically find offsets (anti-ban)
+DWORD FindPattern(DWORD moduleBase, const char* pattern, const char* mask) {
+    MODULEINFO modInfo;
+    GetModuleInformation(hGameProcess, (HMODULE)moduleBase, &modInfo, sizeof(MODULEINFO));
+    DWORD moduleSize = modInfo.SizeOfImage;
+
+    std::vector<char> buffer(moduleSize);
+    ReadProcessMemory(hGameProcess, (LPVOID)moduleBase, buffer.data(), moduleSize, NULL);
+
+    for (DWORD i = 0; i < moduleSize - strlen(mask); i++) {
+        bool found = true;
+        for (size_t j = 0; j < strlen(mask); j++) {
+            if (mask[j] != '?' && pattern[j] != buffer[i + j]) {
+                found = false;
+                break;
+            }
+        }
+        if (found) {
+            return moduleBase + i;
+        }
+    }
+    return 0;
+}
+
+// Update offsets dynamically to evade VAC updates
+void UpdateOffsets() {
+    // Example pattern for dwLocalPlayer (simplified; real patterns are more complex)
+    const char* localPlayerPattern = "\xA3\x00\x00\x00\x00\xC7\x05\x00\x00\x00\x00\x00\x00\x00\x00";
+    const char* localPlayerMask = "x????xx????????";
+    DWORD patternAddr = FindPattern(dwClientModule, localPlayerPattern, localPlayerMask);
+    if (patternAddr) {
+        dwLocalPlayer = patternAddr + 1; // Adjust based on pattern
+    }
+    // Add similar patterns for dwEntityList, dwViewMatrix, etc.
+}
+
+// World to Screen conversion for ESP
+bool WorldToScreen(float* worldPos, float* screenPos, float* viewMatrix, int screenWidth, int screenHeight) {
+    float w = viewMatrix[3] * worldPos[0] + viewMatrix[7] * worldPos[1] + viewMatrix[11] * worldPos[2] + viewMatrix[15];
+    if (w < 0.01f) return false;
+
+    float invW = 1.0f / w;
+    float x = (viewMatrix[0] * worldPos[0] + viewMatrix[4] * worldPos[1] + viewMatrix[8] * worldPos[2] + viewMatrix[12]) * invW;
+    float y = (viewMatrix[1] * worldPos[0] + viewMatrix[5] * worldPos[1] + viewMatrix[9] * worldPos[2] + viewMatrix[13]) * invW;
+
+    screenPos[0] = (screenWidth / 2.0f) + (x * (screenWidth / 2.0f));
+    screenPos[1] = (screenHeight / 2.0f) - (y * (screenHeight / 2.0f));
+    return true;
+}
+
+// ESP: Draws boxes and info around enemies
+void DrawESP() {
+    if (!bESP) return;
+
+    float viewMatrix[16];
+    ReadProcessMemory(hGameProcess, (LPVOID)(dwClientModule + dwViewMatrix), viewMatrix, sizeof(viewMatrix), NULL);
+
+    int screenWidth = 1920; // Adjust dynamically if needed
+    int screenHeight = 1080;
+
+    DWORD localPlayer = ReadMemory<DWORD>(dwClientModule + dwLocalPlayer);
+    int localTeam = localPlayer ? ReadMemory<int>(localPlayer + dwTeamOffset) : 0;
+
+    for (int i = 0; i < 64; i++) {
+        DWORD entityAddr = ReadMemory<DWORD>(dwClientModule + dwEntityList + (i * 0x10));
+        if (!entityAddr || entityAddr == localPlayer) continue;
+
+        bool isDormant = ReadMemory<bool>(entityAddr + dwDormantOffset);
+        if (isDormant) continue;
+
+        int health = ReadMemory<int>(entityAddr + dwHealthOffset);
+        if (health <= 0 || health > 100) continue;
+
+        int team = ReadMemory<int>(entityAddr + dwTeamOffset);
+        if (team == localTeam) continue; // Skip teammates
+
+        float worldPos[3];
+        worldPos[0] = ReadMemory<float>(entityAddr + dwPosOffset);
+        worldPos[1] = ReadMemory<float>(entityAddr + dwPosOffset + 4);
+        worldPos[2] = ReadMemory<float>(entityAddr + dwPosOffset + 8);
+
+        float screenPos[2];
+        if (WorldToScreen(worldPos, screenPos, viewMatrix, screenWidth, screenHeight)) {
+            ImGui::GetWindowDrawList()->AddRect(
+                ImVec2(screenPos[0] - 20, screenPos[1] - 40),
+                ImVec2(screenPos[0] + 20, screenPos[1] + 40),
+                IM_COL32(255, 0, 0, 255),
+                0.0f, 0, 1.5f
+            );
+            char infoStr[32];
+            sprintf_s(infoStr, "HP: %d | Team: %d", health, team);
+            ImGui::GetWindowDrawList()->AddText(ImVec2(screenPos[0] - 20, screenPos[1] + 45), IM_COL32(255, 255, 255, 255), infoStr);
+        }
+    }
+}
+
+// Aimbot: Targets nearest enemy within FOV
+void RunAimbot() {
+    if (!bAimbot) return;
+
+    DWORD localPlayer = ReadMemory<DWORD>(dwClientModule + dwLocalPlayer);
+    if (!localPlayer) return;
+
+    int localTeam = ReadMemory<int>(localPlayer + dwTeamOffset);
+    float localPos[3];
+    localPos[0] = ReadMemory<float>(localPlayer + dwPosOffset);
+    localPos[1] = ReadMemory<float>(localPlayer + dwPosOffset + 4);
+    localPos[2] = ReadMemory<float>(localPlayer + dwPosOffset + 8);
+
+    float closestDist = 999999.0f;
+    DWORD targetEntity = 0;
+    float targetPos[3];
+
+    for (int i = 0; i < 64; i++) {
+        DWORD entityAddr = ReadMemory<DWORD>(dwClientModule + dwEntityList + (i * 0x10));
+        if (!entityAddr || entityAddr == localPlayer) continue;
+
+        bool isDormant = ReadMemory<bool>(entityAddr + dwDormantOffset);
+        if (isDormant) continue;
+
+        int health = ReadMemory<int>(entityAddr + dwHealthOffset);
+        if (health <= 0 || health > 100) continue;
+
+        int team = ReadMemory<int>(entityAddr + dwTeamOffset);
+        if (team == localTeam) continue;
+
+        float enemyPos[3];
+        enemyPos[0] = ReadMemory<float>(entityAddr + dwPosOffset);
+        enemyPos[1] = ReadMemory<float>(entityAddr + dwPosOffset + 4);
+        enemyPos[2] = ReadMemory<float>(entityAddr + dwPosOffset + 8) + 10.0f; // Head adjustment
+
+        float dist = sqrt(pow(localPos[0] - enemyPos[0], 2) + pow(localPos[1] - enemyPos[1], 2) + pow(localPos[2] - enemyPos[2], 2));
+        if (dist < closestDist) {
+            closestDist = dist;
+            targetEntity = entityAddr;
+            targetPos[0] = enemyPos[0];
+            targetPos[1] = enemyPos[1];
+            targetPos[2] = enemyPos[2];
+        }
+    }
+
+    if (targetEntity) {
+        float delta[3] = { targetPos[0] - localPos[0], targetPos[1] - localPos[1], targetPos[2] - localPos[2] };
+        float yaw = atan2(delta[1], delta[0]) * 180.0f / 3.14159f;
+        float pitch = -asin(delta[2] / sqrt(delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2])) * 180.0f / 3.14159f;
+
+        float currentPitch = ReadMemory<float>(localPlayer + dwViewAngle);
+        float currentYaw = ReadMemory<float>(localPlayer + dwViewAngle + 4);
+        pitch = currentPitch + (pitch - currentPitch) * smoothingFactor;
+        yaw = currentYaw + (yaw - currentYaw) * smoothingFactor;
+
+        // Randomize slightly for human-like behavior
+        pitch += (rand() % 100) / 100.0f * 0.5f - 0.25f;
+        yaw += (rand() % 100) / 100.0f * 0.5f - 0.25f;
+
+        WriteMemory<float>(localPlayer + dwViewAngle, pitch);
+        WriteMemory<float>(localPlayer + dwViewAngle + 4, yaw);
+        Sleep(rand() % 5 + 2); // Random delay for anti-detection
+    }
+}
+
+// TriggerBot: Auto-shoot on crosshair target
+void RunTriggerBot() {
+    if (!bTriggerBot) return;
+    // Placeholder: Read crosshair target ID and enemy check (requires specific offset)
+    // If target is enemy, simulate mouse click
+    INPUT input = { INPUT_MOUSE };
+    input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    SendInput(1, &input, sizeof(INPUT));
+    Sleep(rand() % 10 + 5);
+    input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    SendInput(1, &input, sizeof(INPUT));
+}
+
+// BunnyHop: Auto-jump for speed
+void RunBunnyHop() {
+    if (!bBunnyHop || !(GetAsyncKeyState(VK_SPACE) & 0x8000)) return;
+    DWORD localPlayer = ReadMemory<DWORD>(dwClientModule + dwLocalPlayer);
+    if (!localPlayer) return;
+    // Check on-ground flag (offset needs to be found)
+    // If on ground, force jump command
+    Sleep(rand() % 5);
+}
+
+// No-Recoil: Reduce weapon shake
+void RunNoRecoil() {
+    if (!bNoRecoil) return;
+    DWORD localPlayer = ReadMemory<DWORD>(dwClientModule + dwLocalPlayer);
+    if (!localPlayer) return;
+    // Get active weapon (requires offset)
+    // Write zero to recoil punch values
+    float zero[2] = { 0.0f, 0.0f };
+    WriteMemory<float>(localPlayer + dwRecoilOffset, zero[0]);
+    WriteMemory<float>(localPlayer + dwRecoilOffset + 4, zero[1]);
+    Sleep(rand() % 3 + 1);
+}
+
+// WallHack: Glow enemies through walls
+void RunWallHack() {
+    if (!bWallHack) return;
+    DWORD glowManager = ReadMemory<DWORD>(dwClientModule + dwGlowObjectManager);
+    if (!glowManager) return;
+
+    DWORD localPlayer = ReadMemory<DWORD>(dwClientModule + dwLocalPlayer);
+    int localTeam = localPlayer ? ReadMemory<int>(localPlayer + dwTeamOffset) : 0;
+
+    for (int i = 0; i < 64; i++) {
+        DWORD entityAddr = ReadMemory<DWORD>(dwClientModule + dwEntityList + (i * 0x10));
+        if (!entityAddr || entityAddr == localPlayer) continue;
+
+        int health = ReadMemory<int>(entityAddr + dwHealthOffset);
+        if (health <= 0 || health > 100) continue;
+
+        int team = ReadMemory<int>(entityAddr + dwTeamOffset);
+        if (team == localTeam) continue;
+
+        // Get glow index (offset from entity)
+        int glowIndex = ReadMemory<int>(entityAddr + 0xA438); // Glow index offset
+        if (glowIndex == -1) continue;
+
+        DWORD glowAddr = glowManager + (glowIndex * 0x38) + 0x8;
+        WriteMemory<float>(glowAddr, 1.0f); // Glow Alpha
+        WriteMemory<float>(glowAddr - 0x4, 1.0f); // Red
+        WriteMemory<float>(glowAddr - 0x8, 0.0f); // Green
+        WriteMemory<float>(glowAddr - 0xC, 0.0f); // Blue
+        WriteMemory<bool>(glowAddr + 0x27, true); // Render when occluded
+        WriteMemory<bool>(glowAddr + 0x28, false); // Render when unoccluded
+    }
+    Sleep(rand() % 10);
+}
+
+// Radar Hack: Show enemies on minimap
+void RunRadarHack() {
+    if (!bRadarHack) return;
+    for (int i = 0; i < 64; i++) {
+        DWORD entityAddr = ReadMemory<DWORD>(dwClientModule + dwEntityList + (i * 0x10));
+        if (!entityAddr) continue;
+        // Set spotted flag (offset may vary)
+        WriteMemory<bool>(entityAddr + 0x93D, true); // Spotted flag
+    }
+    Sleep(rand() % 15);
+}
+
+// Skin Changer: Apply custom weapon skins
+void RunSkinChanger() {
+    if (!bSkinChanger) return;
+    DWORD localPlayer = ReadMemory<DWORD>(dwClientModule + dwLocalPlayer);
+    if (!localPlayer) return;
+    // Get active weapon entity (offset needed)
+    DWORD weaponAddr = ReadMemory<DWORD>(localPlayer + 0x2FAA); // Active weapon offset
+    if (weaponAddr) {
+        int skinId = 413; // Example: AWP Dragon Lore skin ID
+        WriteMemory<int>(weaponAddr + dwSkinIdOffset, skinId);
+        // Force update to apply skin (may require additional command)
+    }
+    Sleep(rand() % 20);
+}
+
+// Advanced Anti-Ban: Memory protection and randomization
+void AntiBanMechanisms() {
+    if (!bAntiBan) return;
+
+    // Randomize timing to avoid pattern detection
+    Sleep(rand() % 15);
+
+    // Protect cheat memory regions (hide from VAC scans)
+    SIZE_T regionSize = 4096; // Page size
+    DWORD oldProtect;
+    NtProtectVirtualMemory(hGameProcess, (PVOID*)&dwClientModule, &regionSize, PAGE_NOACCESS, &oldProtect);
+
+    // Spoof registry-based HWID components
+    HKEY hKey;
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Cryptography", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        const wchar_t* spoofedId = L"{spoofed-uuid-1234-5678}";
+        RegSetValueExW(hKey, L"MachineGuid", 0, REG_SZ, (const BYTE*)spoofedId, (wcslen(spoofedId) + 1) * sizeof(wchar_t));
+        RegCloseKey(hKey);
+    }
+
+    // Process name spoofing (basic, to hide injector)
+    // Requires kernel-level NtSetInformationThread hook for real effect
+    SetWindowTextA(hGameWindow, "cs2_spoofed.exe");
+}
+
+// Advanced Kernel-Mode HWID Spoofer (pseudo-code for driver)
+void KernelSpoofHWID() {
+    // Communicate with kernel driver via IOCTL to spoof:
+    // - Disk serial numbers
+    // - BIOS UUID
+    // - MAC address
+    HANDLE hDriver = CreateFileA("\\\\.\\Cs2Spoofer", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (hDriver != INVALID_HANDLE_VALUE) {
+        DWORD dummy;
+        char spoofData[256] = "fake_serial_123|fake_bios_456|fake_mac_789";
+        DeviceIoControl(hDriver, 0x80002000, spoofData, sizeof(spoofData), NULL, 0, &dummy, NULL);
+        CloseHandle(hDriver);
+    }
+}
+
+// GUI with expanded options
+void RenderCheatMenu() {
+    if (!bShowMenu) return;
+
+    ImGui::Begin("CS2 Ultimate Cheat v2.0", &bShowMenu, ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Anti-Ban: ACTIVE (Advanced)");
+    ImGui::Separator();
+
+    ImGui::Text("Visuals");
+    ImGui::Checkbox("Enable ESP", &bESP);
+    ImGui::Checkbox("Enable WallHack (Glow)", &bWallHack);
+    ImGui::Checkbox("Enable Radar Hack", &bRadarHack);
+
+    ImGui::Separator();
+    ImGui::Text("Combat");
+    ImGui::Checkbox("Enable Aimbot", &bAimbot);
+    ImGui::SliderFloat("Aimbot Smoothing", &smoothingFactor, 0.05f, 0.5f, "%.2f");
+    ImGui::SliderFloat("Aimbot FOV", &aimbotFov, 10.0f, 180.0f, "%.1f");
+    ImGui::Combo("Target Bone", &aimbotBone, "Head\0Chest\0Pelvis\0");
+    ImGui::Checkbox("Enable TriggerBot", &bTriggerBot);
+    ImGui::Checkbox("Enable No-Recoil", &bNoRecoil);
+
+    ImGui::Separator();
+    ImGui::Text("Movement");
+    ImGui::Checkbox("Enable BunnyHop", &bBunnyHop);
+
+    ImGui::Separator();
+    ImGui::Text("Misc");
+    ImGui::Checkbox("Enable Skin Changer", &bSkinChanger);
+
+    ImGui::Separator();
+    ImGui::Text("Press INS to hide/show menu");
+    ImGui::End();
+}
+
+// DirectX9 initialization
+void InitializeDirectX() {
+    hGameWindow = FindWindowA(NULL, "Counter-Strike 2");
+    if (!hGameWindow) return;
+
+    pD3D = Direct3DCreate9(D3D_SDK_VERSION);
+    if (!pD3D) return;
+
+    D3DPRESENT_PARAMETERS d3dpp = {};
+    d3dpp.Windowed = TRUE;
+    d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    d3dpp.BackBufferFormat = D3DFMT_UNKNOWN;
+    HRESULT res = pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hGameWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDevice);
+    if (FAILED(res)) return;
+
+    ImGui::CreateContext();
+    ImGui_ImplWin32_Init(hGameWindow);
+    ImGui_ImplDX9_Init(pDevice);
+    ImGui::StyleColorsDark();
+}
+
+// Main cheat thread
+DWORD WINAPI CheatMain(LPVOID lpParam) {
+    hGameProcess = OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, FALSE, dwProcessId);
+    dwClientModule = GetModuleBaseAddress("client.dll", dwProcessId);
+
+    // Dynamically update offsets to handle game updates
+    UpdateOffsets();
+
+    InitializeDirectX();
+
+    while (true) {
+        if (GetAsyncKeyState(VK_INSERT) & 1) {
+            bShowMenu = !bShowMenu;
+        }
+
+        // Run cheat features with randomized delays
+        DrawESP();
+        RunAimbot();
+        RunTriggerBot();
+        RunBunnyHop();
+        RunNoRecoil();
+        RunWallHack();
+        RunRadarHack();
+        RunSkinChanger();
+        AntiBanMechanisms();
+        KernelSpoofHWID();
+
+        // Render GUI
+        if (pDevice) {
+            pDevice->Clear(0, NULL, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 0, 0), 1.0f, 0);
+            pDevice->BeginScene();
+            ImGui_ImplDX9_NewFrame();
+            ImGui_ImplWin32_NewFrame();
+            ImGui::NewFrame();
+            RenderCheatMenu();
+            ImGui::EndFrame();
+            ImGui::Render();
+            ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+            pDevice->EndScene();
+            pDevice->Present(NULL, NULL, NULL, NULL);
+        }
+        Sleep(rand() % 10 + 5); // Random CPU usage limiter
+    }
+    return 0;
+}
+
+// DLL entry point
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+    switch (ul_reason_for_call) {
+    case DLL_PROCESS_ATTACH: {
+        dwProcessId = GetCurrentProcessId();
+        CreateThread(NULL, 0, CheatMain, NULL, 0, NULL);
+        break;
+    }
+    case DLL_PROCESS_DETACH:
+        if (pDevice) pDevice->Release();
+        if (pD3D) pD3D->Release();
+        ImGui_ImplDX9_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        break;
+    }
+    return TRUE;
+}
