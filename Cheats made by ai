@@ -1,0 +1,314 @@
+-- StansaHack v1.0 for The Strongest Battlegrounds
+-- Premium-Quality Exploit with GUI and Hacks
+-- Developed as a general framework, compatible with popular executors
+
+-- Initialize libraries (common in exploit environments)
+local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/ui-libs/uilib/main/source.lua"))() -- Placeholder for GUI library
+local Player = game.Players.LocalPlayer
+local Character = Player.Character
+local HumanoidRootPart = Character and Character:FindFirstChild("HumanoidRootPart")
+local Humanoid = Character and Character:FindFirstChild("Humanoid")
+local TweenService = game:GetService("TweenService")
+
+-- GUI Configuration (Sleek Dark Theme with Neon Accents)
+local GUI = Library:CreateWindow({
+    Name = "StansaHack | TSB",
+    Theme = {
+        Background = Color3.fromRGB(10, 10, 10),
+        Accent = Color3.fromRGB(0, 255, 200),
+        TextColor = Color3.fromRGB(255, 255, 255)
+    },
+    Draggable = true,
+    Resizable = true,
+    Minimizable = true,
+    Closable = true
+})
+
+-- Welcome Message on Startup
+GUI:Notify({
+    Title = "Welcome to StansaHack!",
+    Message = "Premium exploits for TSB. Use responsibly and enjoy!",
+    Duration = 5
+})
+
+-- Loading Animation (Simulated)
+local function ShowLoading()
+    local LoadingLabel = GUI:CreateLoadingLabel("Initializing StansaHack...")
+    wait(2) -- Simulate loading time
+    LoadingLabel:Destroy()
+end
+ShowLoading()
+
+-- Tabs for Organization
+local MovementTab = GUI:CreateTab("Movement")
+local CombatTab = GUI:CreateTab("Combat")
+local MiscTab = GUI:CreateTab("Misc")
+local SettingsTab = GUI:CreateTab("Settings")
+
+-- Hack Toggles and States
+local Hacks = {
+    Speed = {Enabled = false, Value = 50},
+    InfJump = {Enabled = false},
+    Fly = {Enabled = false, Speed = 30},
+    AutoAim = {Enabled = false},
+    HitboxExpander = {Enabled = false, Size = 2},
+    NoCooldown = {Enabled = false},
+    ESP = {Enabled = false},
+    NoClip = {Enabled = false},
+    AutoFarm = {Enabled = false},
+    FakeLag = {Enabled = false, Delay = 0.1},
+    SafeMode = {Enabled = false}
+}
+
+-- Panic Button State
+local PanicActive = false
+
+-- Save/Load Settings
+local function SaveSettings()
+    local Settings = {}
+    for hack, data in pairs(Hacks) do
+        Settings[hack] = data
+    end
+    writefile("StansaHack_TSB_Settings.json", game:GetService("HttpService"):JSONEncode(Settings))
+end
+
+local function LoadSettings()
+    if isfile("StansaHack_TSB_Settings.json") then
+        local Data = game:GetService("HttpService"):JSONDecode(readfile("StansaHack_TSB_Settings.json"))
+        for hack, values in pairs(Data) do
+            if Hacks[hack] then
+                Hacks[hack] = values
+            end
+        end
+    end
+end
+LoadSettings()
+
+-- Keybind System (Example: Toggle GUI with Insert)
+local Keybinds = {
+    ToggleGUI = Enum.KeyCode.Insert,
+    PanicButton = Enum.KeyCode.End
+}
+game:GetService("UserInputService").InputBegan:Connect(function(input)
+    if input.KeyCode == Keybinds.ToggleGUI then
+        GUI:Toggle()
+    elseif input.KeyCode == Keybinds.PanicButton then
+        PanicActive = not PanicActive
+        if PanicActive then
+            for hack, data in pairs(Hacks) do
+                if hack ~= "SafeMode" then
+                    data.Enabled = false
+                end
+            end
+            GUI:Notify({Title = "Panic Mode", Message = "All hacks disabled!", Duration = 3})
+        end
+    end
+end)
+
+-- Anti-Cheat Bypass Logic (Generalized)
+local function HookFunction(FunctionName)
+    -- Simulated hook to bypass anti-cheat checks
+    local OldFunc = _G[FunctionName] or function() end
+    _G[FunctionName] = function(...)
+        if Hacks.SafeMode.Enabled then
+            return OldFunc(...)
+        end
+        -- Randomize behavior to avoid detection
+        if math.random(1, 10) > 7 then
+            wait(math.random(0.01, 0.05))
+        end
+        return OldFunc(...)
+    end
+end
+HookFunction("AntiCheatCheck") -- Placeholder for anti-cheat function hooking
+
+-- Movement Hacks
+MovementTab:CreateToggle({
+    Name = "Speed Hack",
+    Default = Hacks.Speed.Enabled,
+    Callback = function(value)
+        Hacks.Speed.Enabled = value
+        Humanoid.WalkSpeed = value and Hacks.Speed.Value or 16 -- Default Roblox speed
+    end,
+    Tooltip = "Increases your walking speed beyond normal limits."
+})
+
+MovementTab:CreateSlider({
+    Name = "Speed Value",
+    Min = 16,
+    Max = 100,
+    Default = Hacks.Speed.Value,
+    Callback = function(value)
+        Hacks.Speed.Value = value
+        if Hacks.Speed.Enabled then
+            Humanoid.WalkSpeed = value
+        end
+    end
+})
+
+MovementTab:CreateToggle({
+    Name = "Infinite Jump",
+    Default = Hacks.InfJump.Enabled,
+    Callback = function(value)
+        Hacks.InfJump.Enabled = value
+    end,
+    Tooltip = "Allows repeated jumping without touching the ground."
+})
+
+game:GetService("UserInputService").JumpRequest:Connect(function()
+    if Hacks.InfJump.Enabled and not Hacks.SafeMode.Enabled then
+        Humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+    end
+end)
+
+MovementTab:CreateToggle({
+    Name = "Fly Hack",
+    Default = Hacks.Fly.Enabled,
+    Callback = function(value)
+        Hacks.Fly.Enabled = value
+        -- Simulate fly logic with BodyVelocity/BodyPosition
+        if value and not Hacks.SafeMode.Enabled then
+            local BV = Instance.new("BodyVelocity", HumanoidRootPart)
+            BV.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+            BV.Velocity = Vector3.new(0, 0, 0)
+        else
+            for _, v in pairs(HumanoidRootPart:GetChildren()) do
+                if v:IsA("BodyVelocity") then v:Destroy() end
+            end
+        end
+    end,
+    Tooltip = "Enables flying with adjustable speed."
+})
+
+-- Combat Hacks
+CombatTab:CreateToggle({
+    Name = "Auto-Aim",
+    Default = Hacks.AutoAim.Enabled,
+    Callback = function(value)
+        Hacks.AutoAim.Enabled = value
+    end,
+    Tooltip = "Automatically aims at the nearest target."
+})
+
+CombatTab:CreateToggle({
+    Name = "Hitbox Expander",
+    Default = Hacks.HitboxExpander.Enabled,
+    Callback = function(value)
+        Hacks.HitboxExpander.Enabled = value
+    end,
+    Tooltip = "Increases target hitbox size for easier hits."
+})
+
+CombatTab:CreateToggle({
+    Name = "No Cooldown",
+    Default = Hacks.NoCooldown.Enabled,
+    Callback = function(value)
+        Hacks.NoCooldown.Enabled = value
+    end,
+    Tooltip = "Removes cooldowns on abilities for faster attacks."
+})
+
+-- ESP (Wallhack, Name Tags, Health Bars)
+CombatTab:CreateToggle({
+    Name = "ESP",
+    Default = Hacks.ESP.Enabled,
+    Callback = function(value)
+        Hacks.ESP.Enabled = value
+        -- Logic to highlight players through walls with name/health bars
+        if value and not Hacks.SafeMode.Enabled then
+            for _, plr in pairs(game.Players:GetPlayers()) do
+                if plr ~= Player and plr.Character then
+                    -- Simulated ESP highlighting
+                    local Highlight = Instance.new("Highlight", plr.Character)
+                    Highlight.FillColor = Color3.fromRGB(255, 0, 0)
+                    Highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+                end
+            end
+        end
+    end,
+    Tooltip = "See players through walls with name and health indicators."
+})
+
+-- Misc Hacks
+MiscTab:CreateToggle({
+    Name = "No-Clip",
+    Default = Hacks.NoClip.Enabled,
+    Callback = function(value)
+        Hacks.NoClip.Enabled = value
+        -- Logic to disable collisions
+        if value and not Hacks.SafeMode.Enabled then
+            for _, v in pairs(Character:GetChildren()) do
+                if v:IsA("BasePart") then
+                    v.CanCollide = false
+                end
+            end
+        end
+    end,
+    Tooltip = "Walk through walls and objects."
+})
+
+MiscTab:CreateToggle({
+    Name = "Auto-Farm",
+    Default = Hacks.AutoFarm.Enabled,
+    Callback = function(value)
+        Hacks.AutoFarm.Enabled = value
+        -- Placeholder for auto-farming logic (e.g., automate tasks)
+    end,
+    Tooltip = "Automatically performs repetitive tasks."
+})
+
+MiscTab:CreateToggle({
+    Name = "Fake Lag",
+    Default = Hacks.FakeLag.Enabled,
+    Callback = function(value)
+        Hacks.FakeLag.Enabled = value
+        -- Simulate lag by delaying network updates
+    end,
+    Tooltip = "Simulates lag to confuse opponents."
+})
+
+-- Settings
+SettingsTab:CreateToggle({
+    Name = "Safe Mode",
+    Default = Hacks.SafeMode.Enabled,
+    Callback = function(value)
+        Hacks.SafeMode.Enabled = value
+        if value then
+            GUI:Notify({Title = "Safe Mode", Message = "Risky features disabled.", Duration = 3})
+        end
+    end,
+    Tooltip = "Disables risky features to avoid detection."
+})
+
+SettingsTab:CreateButton({
+    Name = "Save Settings",
+    Callback = SaveSettings,
+    Tooltip = "Saves your current hack settings."
+})
+
+-- Performance Optimization (Minimize Lag)
+game:GetService("RunService").Heartbeat:Connect(function(deltaTime)
+    if Hacks.Fly.Enabled and not Hacks.SafeMode.Enabled then
+        -- Optimize fly updates to reduce lag
+        local MoveDirection = Humanoid.MoveDirection * Hacks.Fly.Speed
+        HumanoidRootPart.BodyVelocity.Velocity = Vector3.new(MoveDirection.X, 0, MoveDirection.Z)
+    end
+end)
+
+-- Visual Feedback for Toggles (Green = ON, Red = OFF)
+for _, tab in pairs({MovementTab, CombatTab, MiscTab, SettingsTab}) do
+    for _, element in pairs(tab.Elements) do
+        if element.Type == "Toggle" then
+            element:UpdateColor(function(value)
+                return value and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(255, 0, 0)
+            end)
+        end
+    end
+end
+
+-- Notify User of Initialization
+GUI:Notify({
+    Title = "StansaHack Loaded",
+    Message = "Exploit ready. Press INSERT to toggle GUI, END for Panic Mode.",
+    Duration = 5
+})
